@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import argparse
-import cgi
 import hashlib
 import html
 import json
@@ -15,6 +14,8 @@ import sys
 import threading
 import urllib.parse
 from datetime import datetime, timezone
+from email.parser import BytesParser
+from email.policy import default as email_policy
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -162,14 +163,22 @@ class StorageHandler(BaseHTTPRequestHandler):
             content_type = self.headers.get("Content-Type", "")
             if not content_type.startswith("multipart/form-data"):
                 return self.send_json({"error": "Use multipart/form-data."}, 400)
-            form = cgi.FieldStorage(fp=self.rfile, headers=self.headers, environ={
-                "REQUEST_METHOD": "POST", "CONTENT_TYPE": content_type,
-                "CONTENT_LENGTH": str(length),
-            })
-            upload = form["file"] if "file" in form else None
-            if upload is None or not getattr(upload, "filename", None):
+            # cgi.FieldStorage was removed from Python 3.13+. Parse the
+            # multipart body with the maintained email parser instead.
+            body = self.rfile.read(length)
+            message = BytesParser(policy=email_policy).parsebytes(
+                b"Content-Type: " + content_type.encode("ascii", "strict") + b"\r\n\r\n" + body
+            )
+            upload = next(
+                (
+                    part for part in message.iter_parts()
+                    if part.get_param("name", header="content-disposition") == "file"
+                ),
+                None,
+            )
+            if upload is None or not upload.get_filename():
                 return self.send_json({"error": "No file field was provided."}, 400)
-            original_name = Path(os.path.basename(upload.filename)).name
+            original_name = Path(os.path.basename(upload.get_filename())).name
             if not original_name or original_name in (".", ".."):
                 return self.send_json({"error": "Invalid filename."}, 400)
             safe_name = original_name.replace("\x00", "")
@@ -178,7 +187,7 @@ class StorageHandler(BaseHTTPRequestHandler):
                 stem, suffix = destination.stem, destination.suffix
                 destination = self.root / f"{stem}-{secrets.token_hex(3)}{suffix}"
             with destination.open("wb") as output:
-                shutil.copyfileobj(upload.file, output, length=1024 * 1024)
+                output.write(upload.get_payload(decode=True) or b"")
             return self.send_json({"message": "Uploaded", "file": file_info(self.root, destination.relative_to(self.root))}, 201)
         except Exception as exc:
             self.log_message("upload error: %s", exc)
